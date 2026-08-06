@@ -7,17 +7,83 @@
 template <typename T>
 __device__ __host__ inline float to_float(T value) { return static_cast<float>(value); }
 
+#if defined(PLATFORM_ILUVATAR)
+template <>
+__device__ __host__ inline float to_float<half>(half value) {
+  const unsigned short bits = *reinterpret_cast<unsigned short*>(&value);
+  const unsigned sign = static_cast<unsigned>(bits & 0x8000u) << 16;
+  unsigned exponent = (bits >> 10) & 0x1fu;
+  unsigned mantissa = bits & 0x03ffu;
+  unsigned result;
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      result = sign;
+    } else {
+      exponent = 113;
+      while ((mantissa & 0x0400u) == 0) {
+        mantissa <<= 1;
+        --exponent;
+      }
+      result = sign | (exponent << 23) | ((mantissa & 0x03ffu) << 13);
+    }
+  } else if (exponent == 31) {
+    result = sign | 0x7f800000u | (mantissa << 13);
+  } else {
+    result = sign | ((exponent + 112) << 23) | (mantissa << 13);
+  }
+  return *reinterpret_cast<float*>(&result);
+}
+#else
 template <>
 __device__ __host__ inline float to_float<half>(half value) { return __half2float(value); }
+#endif
 
 template <typename T>
 __device__ __host__ inline T from_float(float value) { return static_cast<T>(value); }
 
+#if defined(PLATFORM_ILUVATAR)
+template <>
+__device__ __host__ inline half from_float<half>(float value) {
+  const unsigned bits = *reinterpret_cast<unsigned*>(&value);
+  const unsigned sign = (bits >> 16) & 0x8000u;
+  int exponent = static_cast<int>((bits >> 23) & 0xffu) - 112;
+  const unsigned mantissa = bits & 0x007fffffu;
+  unsigned short result;
+  if (exponent <= 0) {
+    if (exponent < -10) {
+      result = static_cast<unsigned short>(sign);
+    } else {
+      const unsigned rounded = (mantissa | 0x00800000u) >> (1 - exponent);
+      result = static_cast<unsigned short>(sign | ((rounded + 0x00001000u) >> 13));
+    }
+  } else if (exponent >= 31) {
+    result = static_cast<unsigned short>(sign | 0x7c00u);
+  } else {
+    unsigned rounded = mantissa + 0x00001000u;
+    if (rounded & 0x00800000u) {
+      rounded = 0;
+      ++exponent;
+    }
+    result = static_cast<unsigned short>(
+        sign | (exponent >= 31 ? 0x7c00u : (static_cast<unsigned>(exponent) << 10) | (rounded >> 13)));
+  }
+  half output;
+  *reinterpret_cast<unsigned short*>(&output) = result;
+  return output;
+}
+#else
 template <>
 __device__ __host__ inline half from_float<half>(float value) { return __float2half(value); }
+#endif
+
+#if defined(PLATFORM_ILUVATAR)
+#define RMS_NORM_KERNEL iluvatarRmsNormKernel
+#else
+#define RMS_NORM_KERNEL rmsNormKernel
+#endif
 
 template <typename T>
-__global__ void rmsNormKernel(const T* input, const T* weight, T* output,
+__global__ void RMS_NORM_KERNEL(const T* input, const T* weight, T* output,
                               size_t rows, size_t hidden_dim, float eps) {
   extern __shared__ float sums[];
   const size_t row = blockIdx.x;
@@ -41,8 +107,14 @@ __global__ void rmsNormKernel(const T* input, const T* weight, T* output,
   }
 }
 
+#if defined(PLATFORM_ILUVATAR)
+#define FLASH_ATTENTION_KERNEL iluvatarFlashAttentionKernel
+#else
+#define FLASH_ATTENTION_KERNEL flashAttentionKernel
+#endif
+
 template <typename T>
-__global__ void flashAttentionKernel(const T* q, const T* k, const T* v, T* o,
+__global__ void FLASH_ATTENTION_KERNEL(const T* q, const T* k, const T* v, T* o,
                                      int batch_size, int target_len, int source_len,
                                      int query_heads, int kv_heads, int head_dim,
                                      bool is_causal) {
@@ -97,7 +169,7 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
   RUNTIME_CHECK(cudaMalloc(&d_output, rows * hidden_dim * sizeof(T)));
   RUNTIME_CHECK(cudaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(T), cudaMemcpyHostToDevice));
   RUNTIME_CHECK(cudaMemcpy(d_weight, h_weight.data(), h_weight.size() * sizeof(T), cudaMemcpyHostToDevice));
-  rmsNormKernel<T><<<static_cast<unsigned>(rows), 256, 256 * sizeof(float)>>>(
+  RMS_NORM_KERNEL<T><<<static_cast<unsigned>(rows), 256, 256 * sizeof(float)>>>(
       d_input, d_weight, d_output, rows, hidden_dim, eps);
   RUNTIME_CHECK(cudaGetLastError());
   RUNTIME_CHECK(cudaMemcpy(h_output.data(), d_output, rows * hidden_dim * sizeof(T), cudaMemcpyDeviceToHost));
@@ -123,7 +195,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   RUNTIME_CHECK(cudaMemcpy(d_k, h_k.data(), h_k.size() * sizeof(T), cudaMemcpyHostToDevice));
   RUNTIME_CHECK(cudaMemcpy(d_v, h_v.data(), h_v.size() * sizeof(T), cudaMemcpyHostToDevice));
   const int output_rows = batch_size * target_seq_len * query_heads;
-  flashAttentionKernel<T><<<output_rows, head_dim>>>(
+  FLASH_ATTENTION_KERNEL<T><<<output_rows, head_dim>>>(
       d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len,
       query_heads, kv_heads, head_dim, is_causal);
   RUNTIME_CHECK(cudaGetLastError());
