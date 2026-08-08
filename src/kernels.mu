@@ -1,7 +1,108 @@
 #include <vector>
 #include <musa_fp16.h>
+#include <musa_runtime.h>
 
 #include "../tester/utils.h"
+
+template <typename T>
+__device__ __host__ inline float to_float(T value) {
+  return static_cast<float>(value);
+}
+
+template <>
+__device__ __host__ inline float to_float<half>(half value) {
+  return __half2float(value);
+}
+
+template <typename T>
+__device__ __host__ inline T from_float(float value) {
+  return static_cast<T>(value);
+}
+
+template <>
+__device__ __host__ inline half from_float<half>(float value) {
+  return __float2half(value);
+}
+
+template <typename T>
+__global__ void rmsNormKernel(const T* input, const T* weight, T* output,
+                              size_t rows, size_t hidden_dim, float eps) {
+  extern __shared__ float sums[];
+  const size_t row = blockIdx.x;
+  const unsigned tid = threadIdx.x;
+  if (row >= rows) return;
+
+  float sum = 0.0f;
+  const size_t base = row * hidden_dim;
+  for (size_t col = tid; col < hidden_dim; col += blockDim.x) {
+    const float x = to_float(input[base + col]);
+    sum += x * x;
+  }
+  sums[tid] = sum;
+  __syncthreads();
+
+  for (unsigned stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) sums[tid] += sums[tid + stride];
+    __syncthreads();
+  }
+
+  const float inv_rms = rsqrtf(sums[0] / static_cast<float>(hidden_dim) + eps);
+  for (size_t col = tid; col < hidden_dim; col += blockDim.x) {
+    output[base + col] = from_float<T>(
+        to_float(input[base + col]) * inv_rms * to_float(weight[col]));
+  }
+}
+
+template <typename T>
+__global__ void flashAttentionKernel(const T* q, const T* k, const T* v, T* o,
+                                     int batch_size, int target_len, int source_len,
+                                     int query_heads, int kv_heads, int head_dim,
+                                     bool is_causal) {
+  const int linear = blockIdx.x;
+  const int dim = threadIdx.x;
+  if (dim >= head_dim) return;
+
+  const int q_head = linear % query_heads;
+  const int target = (linear / query_heads) % target_len;
+  const int batch = linear / (query_heads * target_len);
+  const int kv_head = q_head / (query_heads / kv_heads);
+  const int q_base = ((batch * target_len + target) * query_heads + q_head) * head_dim;
+  const float scale = rsqrtf(static_cast<float>(head_dim));
+
+  float max_score = -1.0e30f;
+  for (int source = 0; source < source_len; ++source) {
+    if (is_causal && source > target) continue;
+    const int kv_base = ((batch * source_len + source) * kv_heads + kv_head) * head_dim;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+      dot += to_float(q[q_base + d]) * to_float(k[kv_base + d]);
+    }
+    max_score = fmaxf(max_score, dot * scale);
+  }
+
+  float denominator = 0.0f;
+  for (int source = 0; source < source_len; ++source) {
+    if (is_causal && source > target) continue;
+    const int kv_base = ((batch * source_len + source) * kv_heads + kv_head) * head_dim;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+      dot += to_float(q[q_base + d]) * to_float(k[kv_base + d]);
+    }
+    denominator += expf(dot * scale - max_score);
+  }
+
+  float result = 0.0f;
+  for (int source = 0; source < source_len; ++source) {
+    if (is_causal && source > target) continue;
+    const int kv_base = ((batch * source_len + source) * kv_heads + kv_head) * head_dim;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+      dot += to_float(q[q_base + d]) * to_float(k[kv_base + d]);
+    }
+    result += expf(dot * scale - max_score) / denominator * to_float(v[kv_base + dim]);
+  }
+  o[q_base + dim] = from_float<T>(result);
+}
 
 /**
  * @brief Computes RMSNorm over the last dimension of a 2D tensor.
@@ -25,7 +126,25 @@ template <typename T>
 void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
               std::vector<T>& h_output, size_t rows, size_t hidden_dim,
               float eps) {
-  // TODO: Implement the rmsNorm function
+  if (rows == 0 || hidden_dim == 0) return;
+
+  T *d_input = nullptr, *d_weight = nullptr, *d_output = nullptr;
+  RUNTIME_CHECK(musaMalloc(&d_input, h_input.size() * sizeof(T)));
+  RUNTIME_CHECK(musaMalloc(&d_weight, h_weight.size() * sizeof(T)));
+  RUNTIME_CHECK(musaMalloc(&d_output, rows * hidden_dim * sizeof(T)));
+  RUNTIME_CHECK(musaMemcpy(d_input, h_input.data(), h_input.size() * sizeof(T),
+                           musaMemcpyHostToDevice));
+  RUNTIME_CHECK(musaMemcpy(d_weight, h_weight.data(), h_weight.size() * sizeof(T),
+                           musaMemcpyHostToDevice));
+
+  rmsNormKernel<T><<<static_cast<unsigned>(rows), 256, 256 * sizeof(float)>>>(
+      d_input, d_weight, d_output, rows, hidden_dim, eps);
+  RUNTIME_CHECK(musaGetLastError());
+  RUNTIME_CHECK(musaMemcpy(h_output.data(), d_output,
+                           rows * hidden_dim * sizeof(T), musaMemcpyDeviceToHost));
+  RUNTIME_CHECK(musaFree(d_input));
+  RUNTIME_CHECK(musaFree(d_weight));
+  RUNTIME_CHECK(musaFree(d_output));
 }
 
 /**
@@ -49,7 +168,33 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
                     int batch_size, int target_seq_len, int src_seq_len, 
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+  if (batch_size <= 0 || target_seq_len <= 0 || src_seq_len <= 0 ||
+      query_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+      query_heads % kv_heads != 0 || head_dim > 1024) return;
+
+  T *d_q = nullptr, *d_k = nullptr, *d_v = nullptr, *d_o = nullptr;
+  RUNTIME_CHECK(musaMalloc(&d_q, h_q.size() * sizeof(T)));
+  RUNTIME_CHECK(musaMalloc(&d_k, h_k.size() * sizeof(T)));
+  RUNTIME_CHECK(musaMalloc(&d_v, h_v.size() * sizeof(T)));
+  RUNTIME_CHECK(musaMalloc(&d_o, h_o.size() * sizeof(T)));
+  RUNTIME_CHECK(musaMemcpy(d_q, h_q.data(), h_q.size() * sizeof(T),
+                           musaMemcpyHostToDevice));
+  RUNTIME_CHECK(musaMemcpy(d_k, h_k.data(), h_k.size() * sizeof(T),
+                           musaMemcpyHostToDevice));
+  RUNTIME_CHECK(musaMemcpy(d_v, h_v.data(), h_v.size() * sizeof(T),
+                           musaMemcpyHostToDevice));
+
+  const int output_rows = batch_size * target_seq_len * query_heads;
+  flashAttentionKernel<T><<<output_rows, head_dim>>>(
+      d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len,
+      query_heads, kv_heads, head_dim, is_causal);
+  RUNTIME_CHECK(musaGetLastError());
+  RUNTIME_CHECK(musaMemcpy(h_o.data(), d_o, h_o.size() * sizeof(T),
+                           musaMemcpyDeviceToHost));
+  RUNTIME_CHECK(musaFree(d_q));
+  RUNTIME_CHECK(musaFree(d_k));
+  RUNTIME_CHECK(musaFree(d_v));
+  RUNTIME_CHECK(musaFree(d_o));
 }
 
 // *********************************************************************
