@@ -13,16 +13,16 @@
 python data\generate_cases.py
 ```
 
-生成的案例包括：
+生成的案例包括。所有生成案例均设置 `record_interval = 1`，即每个模拟时间步都保存一个轨迹帧；因此 `num_steps = S` 时输出帧数为 `S + 1`（包括初始状态），不会出现只生成几十帧的问题：
 
 | 案例 | 粒子数 | 用途 |
 |---|---:|---|
-| `two_body` | 2 | 圆轨道和能量稳定性验证 |
-| `solar_system` | 5 | 中心大质量天体和多轨道扰动 |
-| `cluster_64` | 64 | 三维星团演化、聚团/散射 |
-| `disk_1024` | 1025 | 粒子盘和中等规模性能测试 |
-| `benchmark_4096` | 4096 | 基础版验收：1000 步 |
-| `benchmark_65536` | 65536 | 进阶版验收：1000 步 |
+| `two_body` | 2 | 1000 步圆轨道和能量稳定性验证 |
+| `solar_system` | 5 | 1000 步中心大质量天体和多轨道扰动 |
+| `cluster_64` | 64 | 1000 步三维星团演化、聚团/散射 |
+| `disk_1024` | 1025 | 1000 步粒子盘和中等规模性能测试 |
+| `benchmark_4096` | 4096 | 基础版验收：1000 步、1001 帧 |
+| `benchmark_65536` | 65536 | 进阶版验收：1000 步、1001 帧 |
 
 例如运行 1024 粒子盘：
 
@@ -46,7 +46,7 @@ integrator = leapfrog
 
 ## 输出格式
 
-`trajectory.bin` 为小端二进制：文件头是两个 `int32`（粒子数 `P`、记录数 `R`），之后按**粒子顺序**写入该粒子的全部记录点，每个记录点是三个 `float32`：`x,y,z`。即文件布局为 `[P, R, xyz]`。二进制比 CSV 体积更小，读写和解析开销更低。
+`trajectory.bin` 为小端二进制：文件头是两个 `int32`（粒子数 `P`、记录数 `R`），之后按**粒子顺序**写入该粒子的全部记录点，每个记录点是三个 `float32`：`x,y,z`。即文件布局为 `[P, R, xyz]`。二进制比 CSV 体积更小，读写和解析开销更低。注意：总时间步数是 `num_steps`，轨迹帧数是 `num_steps / record_interval + 1`；要求的 1000 步不等价于必须输出 1000 帧，但本项目测试案例按每步记录，输出至少 1001 帧。
 
 默认生成 `performance.log`，也可用第 4 个参数指定日志路径。日志包含：
 
@@ -79,10 +79,11 @@ Linux 编译和验收命令：
 ```bash
 # 编译nbody
 nvcc -std=c++17 -lineinfo -arch=sm_89 nbody.cu -o nbody
-# 
+# 测试 两个粒子
 ./nbody data/two_body_particles.txt data/two_body_params.txt two_body.bin two_body.log
-
+# 测试 4096个粒子
 ./nbody data/benchmark_4096_particles.txt data/benchmark_4096_params.txt benchmark_4096.bin benchmark_4096.log
+# 测试 65536个粒子
 ./nbody data/benchmark_65536_particles.txt data/benchmark_65536_params.txt benchmark_65536.bin benchmark_65536.log
 ```
 
@@ -121,7 +122,7 @@ $$M_{GPU} = 3 \times N \times 16 = 48N\text{ bytes}$$
 
 $$M_{trajectory} = (S / R + 1) \times N \times 3 \times 4$$
 
-其中 $N$ 是粒子数，$S$ 是总步数，$R$ 是记录间隔。共享内存每个 block 约为 `256 * 16 = 4096` 字节。
+其中 $N$ 是粒子数，$S$ 是总步数，$R$ 是记录间隔。生成的验收案例使用 $R=1$，所以 1000 步会输出 1001 帧。共享内存每个 block 约为 `256 * 16 = 4096` 字节。
 
 仅按当前设备数组计算：
 
@@ -134,4 +135,4 @@ $$M_{trajectory} = (S / R + 1) \times N \times 3 \times 4$$
 
 因此 RTX 4090 的 24 GiB 显存完全可以运行题目要求的 4,096、65,536 粒子规模；甚至从“存储数组”角度可以容纳数亿粒子。但当前直接 N 体算法每一步需要 $N^2$ 次相互作用，真正瓶颈是计算时间而不是显存：$65,536^2 \approx 4.29$ 亿次相互作用/步，1000 步约 4.29 万亿次相互作用，可能需要较长时间。
 
-此外，程序将所有轨迹保存在 CPU 内存中，若 $N=65,536$、记录 1001 次，轨迹约为 0.73 GiB；应增大 `record_interval`，避免主机内存和文件过大。RTX 4090 可以运行，但建议先用 `cluster_64`、`disk_1024` 验证，再逐步扩大规模。
+此外，程序将所有轨迹保存在 CPU 内存中，若 $N=65,536$、记录 1001 次，轨迹约为 0.73 GiB；每步记录会增加主机内存和文件大小。RTX 4090 可以运行，但建议先用 `cluster_64`、`disk_1024` 验证，再执行 `benchmark_4096`，最后执行 `benchmark_65536`。

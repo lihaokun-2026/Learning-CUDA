@@ -23,8 +23,12 @@ def load_trajectory(path: str):
 
 
 def axis_limits(values):
-    minimum = values.min(axis=(0, 1))
-    maximum = values.max(axis=(0, 1))
+    flattened = values.reshape(-1, values.shape[-1])
+    minimum = np.percentile(flattened, 1.0, axis=0)
+    maximum = np.percentile(flattened, 99.0, axis=0)
+    # Include the full initial state when it is not an outlier.
+    minimum = np.minimum(minimum, values[0].min(axis=0))
+    maximum = np.maximum(maximum, values[0].max(axis=0))
     center = (minimum + maximum) * 0.5
     half_range = max(float((maximum - minimum).max()) * 0.55, 1.0e-3)
     return [(c - half_range, c + half_range) for c in center]
@@ -44,7 +48,7 @@ def animate_2d(trajectory, output=None, interval=40, trail=0):
     limits = axis_limits(trajectory[:, :, :2])
     ax.set(xlim=limits[0], ylim=limits[1], xlabel="x", ylabel="y", aspect="equal")
     points, = ax.plot([], [], "o", ms=4, alpha=0.85)
-    trails = [ax.plot([], [], "-", lw=0.7, alpha=0.35)[0] for _ in range(trajectory.shape[1])]
+    trails = [ax.plot([], [], "-", lw=0.7, alpha=0.35)[0] for _ in range(trajectory.shape[1])] if trail else []
     title = ax.set_title("")
 
     def update(frame):
@@ -67,7 +71,7 @@ def animate_3d(trajectory, output=None, interval=40, trail=0):
     ax.set(xlim=limits[0], ylim=limits[1], zlim=limits[2], xlabel="x", ylabel="y", zlabel="z")
     ax.set_box_aspect((1, 1, 1))
     points = ax.scatter([], [], [], s=14, alpha=0.85)
-    trails = [ax.plot([], [], [], "-", lw=0.7, alpha=0.35)[0] for _ in range(trajectory.shape[1])]
+    trails = [ax.plot([], [], [], "-", lw=0.7, alpha=0.35)[0] for _ in range(trajectory.shape[1])] if trail else []
     title = ax.set_title("")
 
     def update(frame):

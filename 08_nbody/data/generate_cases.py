@@ -20,18 +20,21 @@ def write_case(name, particles, params):
 
 
 def write_large_disk(name, count, params, seed):
-    """Stream a large rotating 3D disk to avoid building a large Python list."""
+    """Stream a stable 3D disk around a massive central body."""
     rng = random.Random(seed)
     path = ROOT / f"{name}_particles.txt"
     with path.open("w", encoding="utf-8") as output:
-        for _ in range(count):
+        # The central body prevents the equal-mass disk from collapsing under
+        # its own gravity and makes the benchmark visually interpretable.
+        output.write("0 0 0 0 0 0 1000\n")
+        for _ in range(count - 1):
             radius = 0.5 + 9.5 * math.sqrt(rng.random())
             angle = 2 * math.pi * rng.random()
             z = rng.gauss(0, 0.03)
-            speed = math.sqrt(1.0 / radius)
+            speed = math.sqrt(1000.0 / radius)
             values = (radius * math.cos(angle), radius * math.sin(angle), z,
                       -speed * math.sin(angle), speed * math.cos(angle),
-                      rng.gauss(0, 0.002), 1.0 / count)
+                      rng.gauss(0, 0.002), 1.0e-4)
             output.write("{:.9g} {:.9g} {:.9g} {:.9g} {:.9g} {:.9g} {:.9g}\n".format(*values))
     (ROOT / f"{name}_params.txt").write_text(
         "\n".join(f"{key} = {value}" for key, value in params.items()) + "\n",
@@ -105,14 +108,14 @@ def disk(count=1024, seed=11):
     return particles
 
 
-COMMON = {"dt": "1e-3", "record_interval": "100", "G": "1.0", "softening": "1e-4", "integrator": "leapfrog"}
-write_case("two_body", two_body(), {**COMMON, "num_steps": "2000"})
-write_case("solar_system", solar_system(), {**COMMON, "dt": "1e-4", "num_steps": "5000", "record_interval": "500"})
-write_case("cluster_64", cluster(), {**COMMON, "dt": "2e-4", "num_steps": "2000"})
-write_case("plummer_256", plummer_sphere(), {**COMMON, "dt": "2e-3", "num_steps": "4000", "record_interval": "40", "softening": "2e-2"})
-write_case("disk_1024", disk(), {**COMMON, "dt": "1e-4", "num_steps": "1000", "record_interval": "100"})
+COMMON = {"dt": "1e-3", "record_interval": "1", "G": "1.0", "softening": "1e-4", "integrator": "leapfrog"}
+write_case("two_body", two_body(), {**COMMON, "num_steps": "1000"})
+write_case("solar_system", solar_system(), {**COMMON, "dt": "1e-4", "num_steps": "1000"})
+write_case("cluster_64", cluster(), {**COMMON, "dt": "2e-4", "num_steps": "1000"})
+write_case("plummer_256", plummer_sphere(), {**COMMON, "dt": "2e-3", "num_steps": "1000", "softening": "2e-2"})
+write_case("disk_1024", disk(), {**COMMON, "dt": "1e-4", "num_steps": "1000"})
 write_large_disk("benchmark_4096", 4096,
-                 {**COMMON, "dt": "1e-3", "num_steps": "1000", "record_interval": "100", "softening": "1e-2"}, 41)
+                 {**COMMON, "dt": "1e-3", "num_steps": "1000", "softening": "1e-2"}, 41)
 write_large_disk("benchmark_65536", 65536,
-                 {**COMMON, "dt": "1e-3", "num_steps": "1000", "record_interval": "100", "softening": "1e-2"}, 43)
+                 {**COMMON, "dt": "1e-3", "num_steps": "1000", "softening": "1e-2"}, 43)
 print("Generated validation cases plus benchmark_4096 and benchmark_65536 in", ROOT)
