@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -37,6 +38,96 @@ struct Params {
 struct Body {
     float x, y, z, vx, vy, vz, mass;
 };
+
+struct Diagnostics {
+    double energy = 0.0;
+    double px = 0.0, py = 0.0, pz = 0.0;
+    double momentum_scale = 0.0;
+    bool sampled_energy = false;
+    std::uint64_t energy_pairs = 0;
+};
+
+static Diagnostics compute_diagnostics(const std::vector<Body>& bodies, float gravitational_constant,
+                                       float softening) {
+    Diagnostics result;
+    for (const Body& body : bodies) {
+        const double speed_squared = static_cast<double>(body.vx) * body.vx +
+                                     static_cast<double>(body.vy) * body.vy +
+                                     static_cast<double>(body.vz) * body.vz;
+        result.energy += 0.5 * body.mass * speed_squared;
+        result.px += static_cast<double>(body.mass) * body.vx;
+        result.py += static_cast<double>(body.mass) * body.vy;
+        result.pz += static_cast<double>(body.mass) * body.vz;
+        result.momentum_scale += std::abs(static_cast<double>(body.mass)) * std::sqrt(speed_squared);
+    }
+
+    const std::uint64_t n = bodies.size();
+    const std::uint64_t total_pairs = n * (n - 1) / 2;
+    constexpr std::uint64_t MAX_ENERGY_PAIRS = 8'000'000;
+    double potential_sum = 0.0;
+    if (total_pairs <= MAX_ENERGY_PAIRS) {
+        result.energy_pairs = total_pairs;
+        for (std::uint64_t i = 0; i < n; ++i) {
+            for (std::uint64_t j = i + 1; j < n; ++j) {
+                const double dx = static_cast<double>(bodies[j].x) - bodies[i].x;
+                const double dy = static_cast<double>(bodies[j].y) - bodies[i].y;
+                const double dz = static_cast<double>(bodies[j].z) - bodies[i].z;
+                const double distance = std::sqrt(dx * dx + dy * dy + dz * dz +
+                                                  static_cast<double>(softening) * softening);
+                potential_sum -= gravitational_constant * bodies[i].mass * bodies[j].mass / distance;
+            }
+        }
+    } else {
+        result.sampled_energy = true;
+        result.energy_pairs = MAX_ENERGY_PAIRS;
+        std::uint64_t state = 0x9e3779b97f4a7c15ULL;
+        for (std::uint64_t sample = 0; sample < MAX_ENERGY_PAIRS; ++sample) {
+            state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+            const std::uint64_t i = (state * 0x2545F4914F6CDD1DULL) % n;
+            state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+            std::uint64_t j = (state * 0x2545F4914F6CDD1DULL) % (n - 1);
+            if (j >= i) ++j;
+            const double dx = static_cast<double>(bodies[j].x) - bodies[i].x;
+            const double dy = static_cast<double>(bodies[j].y) - bodies[i].y;
+            const double dz = static_cast<double>(bodies[j].z) - bodies[i].z;
+            const double distance = std::sqrt(dx * dx + dy * dy + dz * dz +
+                                              static_cast<double>(softening) * softening);
+            potential_sum -= gravitational_constant * bodies[i].mass * bodies[j].mass / distance;
+        }
+        potential_sum *= static_cast<double>(total_pairs) / MAX_ENERGY_PAIRS;
+    }
+    result.energy += potential_sum;
+    return result;
+}
+
+static double benchmark_cpu_force(const std::vector<Body>& input, const Params& params,
+                                  int& benchmark_particles, int& benchmark_steps) {
+    benchmark_particles = std::min<int>(static_cast<int>(input.size()), 1024);
+    const std::uint64_t interactions_per_step = static_cast<std::uint64_t>(benchmark_particles) * benchmark_particles;
+    benchmark_steps = std::max(1, std::min<int>(100, static_cast<int>(20'000'000 / std::max<std::uint64_t>(1, interactions_per_step))));
+    std::vector<float4> acceleration(benchmark_particles);
+    volatile float checksum = 0.0f;
+    const auto start = std::chrono::steady_clock::now();
+    for (int step = 0; step < benchmark_steps; ++step) {
+        for (int i = 0; i < benchmark_particles; ++i) {
+            float ax = 0, ay = 0, az = 0;
+            for (int j = 0; j < benchmark_particles; ++j) {
+                const float dx = input[j].x - input[i].x;
+                const float dy = input[j].y - input[i].y;
+                const float dz = input[j].z - input[i].z;
+                const float r2 = dx * dx + dy * dy + dz * dz + params.softening * params.softening;
+                const float inv_r = 1.0f / std::sqrt(r2);
+                const float scale = params.G * input[j].mass * inv_r * inv_r * inv_r;
+                ax += dx * scale; ay += dy * scale; az += dz * scale;
+            }
+            acceleration[i] = make_float4(ax, ay, az, 0);
+        }
+        checksum += acceleration[step % benchmark_particles].x;
+    }
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    if (!std::isfinite(checksum)) throw std::runtime_error("CPU benchmark produced non-finite values");
+    return interactions_per_step * static_cast<double>(benchmark_steps) / seconds;
+}
 
 __global__ void acceleration_kernel(const float4* positions, float4* acceleration,
                                     int n, float gravitational_constant,
@@ -140,8 +231,8 @@ static void write_trajectory(const std::string& path, int n, int records,
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3 || argc > 4) {
-        std::cerr << "Usage: nbody <particles.txt> <params.txt> [trajectory.bin]\n";
+    if (argc < 3 || argc > 5) {
+        std::cerr << "Usage: nbody <particles.txt> <params.txt> [trajectory.bin] [performance.log]\n";
         return 2;
     }
     try {
@@ -149,9 +240,11 @@ int main(int argc, char** argv) {
         Params params;
         read_particles(argv[1], bodies);
         read_params(argv[2], params);
-        const std::string output_path = argc == 4 ? argv[3] : "trajectory.bin";
+        const std::string output_path = argc >= 4 ? argv[3] : "trajectory.bin";
+        const std::string log_path = argc >= 5 ? argv[4] : "performance.log";
         const int n = static_cast<int>(bodies.size());
         const int records = params.steps / params.record_interval + 1;
+        const Diagnostics initial_diagnostics = compute_diagnostics(bodies, params.G, params.softening);
         std::vector<float> trajectory(static_cast<size_t>(records) * n * 3);
         std::vector<float4> host_positions(n), host_velocities(n);
         for (int i = 0; i < n; ++i) {
@@ -168,13 +261,17 @@ int main(int argc, char** argv) {
         auto record = [&](int index) {
             CUDA_CHECK(cudaMemcpy(host_positions.data(), positions, n * sizeof(float4), cudaMemcpyDeviceToHost));
             for (int i = 0; i < n; ++i) {
-                trajectory[(static_cast<size_t>(index) * n + i) * 3 + 0] = host_positions[i].x;
-                trajectory[(static_cast<size_t>(index) * n + i) * 3 + 1] = host_positions[i].y;
-                trajectory[(static_cast<size_t>(index) * n + i) * 3 + 2] = host_positions[i].z;
+                trajectory[(static_cast<size_t>(i) * records + index) * 3 + 0] = host_positions[i].x;
+                trajectory[(static_cast<size_t>(i) * records + index) * 3 + 1] = host_positions[i].y;
+                trajectory[(static_cast<size_t>(i) * records + index) * 3 + 2] = host_positions[i].z;
             }
         };
         record(0);
         CUDA_CHECK(cudaDeviceSynchronize());
+        cudaEvent_t gpu_start, gpu_stop;
+        CUDA_CHECK(cudaEventCreate(&gpu_start));
+        CUDA_CHECK(cudaEventCreate(&gpu_stop));
+        CUDA_CHECK(cudaEventRecord(gpu_start));
         const auto start = std::chrono::steady_clock::now();
         int record_index = 1;
         if (params.integrator == "leapfrog") {
@@ -190,19 +287,77 @@ int main(int argc, char** argv) {
             } else {
                 drift_kernel<<<blocks, TILE_SIZE>>>(positions, velocities, n, params.dt);
                 acceleration_kernel<<<blocks, TILE_SIZE>>>(positions, acceleration, n, params.G, params.softening * params.softening);
-                kick_kernel<<<blocks, TILE_SIZE>>>(velocities, acceleration, n, 0.5f * params.dt);
+                const float kick_dt = (step == params.steps) ? 0.5f * params.dt : params.dt;
+                kick_kernel<<<blocks, TILE_SIZE>>>(velocities, acceleration, n, kick_dt);
             }
             CUDA_CHECK(cudaGetLastError());
             if (step % params.record_interval == 0) record(record_index++);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
-        write_trajectory(output_path, n, records, trajectory);
+         CUDA_CHECK(cudaEventRecord(gpu_stop));
+         CUDA_CHECK(cudaEventSynchronize(gpu_stop));
+         float gpu_milliseconds = 0.0f;
+         CUDA_CHECK(cudaEventElapsedTime(&gpu_milliseconds, gpu_start, gpu_stop));
+        CUDA_CHECK(cudaMemcpy(host_positions.data(), positions, n * sizeof(float4), cudaMemcpyDeviceToHost));
+         CUDA_CHECK(cudaMemcpy(host_velocities.data(), velocities, n * sizeof(float4), cudaMemcpyDeviceToHost));
+         std::vector<Body> final_bodies(n);
+         for (int i = 0; i < n; ++i) {
+             final_bodies[i] = {host_positions[i].x, host_positions[i].y, host_positions[i].z,
+                       host_velocities[i].x, host_velocities[i].y, host_velocities[i].z,
+                       host_positions[i].w};
+         }
+         const Diagnostics final_diagnostics = compute_diagnostics(final_bodies, params.G, params.softening);
+         const auto io_start = std::chrono::steady_clock::now();
+         write_trajectory(output_path, n, records, trajectory);
+         const double io_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - io_start).count();
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         const double interactions = static_cast<double>(n) * n * params.steps;
-        std::cout << "particles=" << n << " steps=" << params.steps << " records=" << records << "\n"
-                  << "integrator=" << params.integrator << " elapsed_sec=" << std::fixed << std::setprecision(6) << seconds
-                  << " particle_steps_per_sec=" << (seconds > 0 ? n * params.steps / seconds : 0) << "\n"
-                  << "interactions_per_sec=" << (seconds > 0 ? interactions / seconds : 0) << "\n";
+         const double simulation_seconds = gpu_milliseconds / 1000.0;
+         const double gpu_rate = interactions / simulation_seconds;
+         int cpu_particles = 0, cpu_steps = 0;
+         const double cpu_rate = benchmark_cpu_force(bodies, params, cpu_particles, cpu_steps);
+         const double initial_momentum = std::sqrt(initial_diagnostics.px * initial_diagnostics.px +
+                                 initial_diagnostics.py * initial_diagnostics.py +
+                                 initial_diagnostics.pz * initial_diagnostics.pz);
+         const double delta_px = final_diagnostics.px - initial_diagnostics.px;
+         const double delta_py = final_diagnostics.py - initial_diagnostics.py;
+         const double delta_pz = final_diagnostics.pz - initial_diagnostics.pz;
+         const double momentum_error = std::sqrt(delta_px * delta_px + delta_py * delta_py + delta_pz * delta_pz) /
+                           std::max(initial_diagnostics.momentum_scale, 1.0e-30);
+         const double energy_error = std::abs(final_diagnostics.energy - initial_diagnostics.energy) /
+                         std::max(std::abs(initial_diagnostics.energy), 1.0e-30);
+         size_t free_memory = 0, total_memory = 0;
+         CUDA_CHECK(cudaMemGetInfo(&free_memory, &total_memory));
+         cudaDeviceProp device{};
+         CUDA_CHECK(cudaGetDeviceProperties(&device, 0));
+         std::ostringstream report;
+         report << std::fixed << std::setprecision(6)
+             << "device=" << device.name << "\n"
+             << "particles=" << n << "\nsteps=" << params.steps << "\nrecords=" << records << "\n"
+             << "integrator=" << params.integrator << "\ndt=" << params.dt << "\n"
+             << "gpu_simulation_sec=" << simulation_seconds << "\n"
+             << "wall_total_sec=" << seconds << "\ntrajectory_io_sec=" << io_seconds << "\n"
+             << "average_step_ms=" << (gpu_milliseconds / std::max(params.steps, 1)) << "\n"
+             << "particle_steps_per_sec=" << (simulation_seconds > 0 ? n * params.steps / simulation_seconds : 0) << "\n"
+             << "interactions_per_sec=" << gpu_rate << "\n"
+             << "cpu_benchmark_particles=" << cpu_particles << "\ncpu_benchmark_steps=" << cpu_steps << "\n"
+             << "cpu_interactions_per_sec=" << cpu_rate << "\n"
+             << "estimated_gpu_vs_cpu_speedup=" << (cpu_rate > 0 ? gpu_rate / cpu_rate : 0) << "\n"
+             << "device_array_bytes=" << static_cast<std::uint64_t>(3) * n * sizeof(float4) << "\n"
+             << "gpu_memory_used_bytes=" << (total_memory - free_memory) << "\n"
+             << "initial_momentum_norm=" << initial_momentum << "\n"
+             << "relative_momentum_error=" << momentum_error << "\n"
+             << "initial_energy=" << initial_diagnostics.energy << "\nfinal_energy=" << final_diagnostics.energy << "\n"
+             << "relative_energy_error=" << energy_error << "\n"
+             << "energy_diagnostic=" << (initial_diagnostics.sampled_energy ? "sampled" : "exact") << "\n"
+             << "energy_pairs_evaluated=" << initial_diagnostics.energy_pairs << "\n"
+             << "trajectory_layout=particle-major [P,R,xyz]\n";
+         std::ofstream log(log_path);
+         if (!log) throw std::runtime_error("cannot create performance log: " + log_path);
+         log << report.str();
+         std::cout << report.str() << "trajectory_file=" << output_path << "\nperformance_log=" << log_path << "\n";
+         CUDA_CHECK(cudaEventDestroy(gpu_start));
+         CUDA_CHECK(cudaEventDestroy(gpu_stop));
         cudaFree(positions); cudaFree(velocities); cudaFree(acceleration);
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n';

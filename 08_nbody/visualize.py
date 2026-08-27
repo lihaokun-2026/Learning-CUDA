@@ -17,25 +17,20 @@ def load_trajectory(path: str):
     expected = records * particles * 3
     if particles <= 0 or records <= 0 or data.size != expected:
         raise ValueError(f"invalid trajectory dimensions: particles={particles}, records={records}")
-    return data.reshape(records, particles, 3)
+    # File layout is particle-major: [particle, record, (x, y, z)].
+    # Animation code uses frame-major: [record, particle, (x, y, z)].
+    return data.reshape(particles, records, 3).transpose(1, 0, 2)
 
 
-def animate_2d(trajectory, output=None, interval=40, trail=0):
-    fig, ax = plt.subplots(figsize=(8, 8))
-    xy = trajectory[:, :, :2]
-    limit = max(float(np.abs(xy).max()), 1.0) * 1.1
-    ax.set(xlim=(-limit, limit), ylim=(-limit, limit), xlabel="x", ylabel="y", aspect="equal")
-    points, = ax.plot([], [], "o", ms=3, alpha=0.8)
-    title = ax.set_title("")
+def axis_limits(values):
+    minimum = values.min(axis=(0, 1))
+    maximum = values.max(axis=(0, 1))
+    center = (minimum + maximum) * 0.5
+    half_range = max(float((maximum - minimum).max()) * 0.55, 1.0e-3)
+    return [(c - half_range, c + half_range) for c in center]
 
-    def update(frame):
-        start = max(0, frame - trail) if trail else frame
-        visible = xy[start:frame + 1]
-        points.set_data(visible[-1, :, 0], visible[-1, :, 1])
-        title.set_text(f"N-body simulation — frame {frame + 1}/{len(xy)}")
-        return points, title
 
-    animation = FuncAnimation(fig, update, frames=len(xy), interval=interval, blit=True)
+def save_or_show(animation, output):
     if output:
         suffix = Path(output).suffix.lower()
         writer = "pillow" if suffix == ".gif" else "ffmpeg"
@@ -44,14 +39,62 @@ def animate_2d(trajectory, output=None, interval=40, trail=0):
         plt.show()
 
 
+def animate_2d(trajectory, output=None, interval=40, trail=0):
+    fig, ax = plt.subplots(figsize=(8, 8))
+    limits = axis_limits(trajectory[:, :, :2])
+    ax.set(xlim=limits[0], ylim=limits[1], xlabel="x", ylabel="y", aspect="equal")
+    points, = ax.plot([], [], "o", ms=4, alpha=0.85)
+    trails = [ax.plot([], [], "-", lw=0.7, alpha=0.35)[0] for _ in range(trajectory.shape[1])]
+    title = ax.set_title("")
+
+    def update(frame):
+        start = max(0, frame - trail) if trail else frame
+        visible = trajectory[start:frame + 1]
+        points.set_data(visible[-1, :, 0], visible[-1, :, 1])
+        for particle, line in enumerate(trails):
+            line.set_data(visible[:, particle, 0], visible[:, particle, 1])
+        title.set_text(f"N-body 2D — frame {frame + 1}/{len(trajectory)}")
+        return (points, title, *trails)
+
+    animation = FuncAnimation(fig, update, frames=len(trajectory), interval=interval, blit=True)
+    save_or_show(animation, output)
+
+
+def animate_3d(trajectory, output=None, interval=40, trail=0):
+    fig = plt.figure(figsize=(9, 8))
+    ax = fig.add_subplot(111, projection="3d")
+    limits = axis_limits(trajectory)
+    ax.set(xlim=limits[0], ylim=limits[1], zlim=limits[2], xlabel="x", ylabel="y", zlabel="z")
+    ax.set_box_aspect((1, 1, 1))
+    points = ax.scatter([], [], [], s=14, alpha=0.85)
+    trails = [ax.plot([], [], [], "-", lw=0.7, alpha=0.35)[0] for _ in range(trajectory.shape[1])]
+    title = ax.set_title("")
+
+    def update(frame):
+        start = max(0, frame - trail) if trail else frame
+        visible = trajectory[start:frame + 1]
+        points._offsets3d = (visible[-1, :, 0], visible[-1, :, 1], visible[-1, :, 2])
+        for particle, line in enumerate(trails):
+            line.set_data_3d(visible[:, particle, 0], visible[:, particle, 1], visible[:, particle, 2])
+        ax.view_init(elev=25, azim=35 + frame * 0.4)
+        title.set_text(f"N-body 3D — frame {frame + 1}/{len(trajectory)}")
+        return (points, title, *trails)
+
+    animation = FuncAnimation(fig, update, frames=len(trajectory), interval=interval, blit=False)
+    save_or_show(animation, output)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Visualize nbody trajectory.bin")
     parser.add_argument("trajectory", nargs="?", default="trajectory.bin")
     parser.add_argument("--output", help="GIF or MP4 output path")
     parser.add_argument("--interval", type=int, default=40)
-    parser.add_argument("--trail", type=int, default=0, help="reserved for future trail rendering")
+    parser.add_argument("--trail", type=int, default=20, help="number of previous frames in each trail; 0 disables trails")
+    parser.add_argument("--dimension", choices=("2d", "3d"), default="3d")
     args = parser.parse_args()
-    animate_2d(load_trajectory(args.trajectory), args.output, args.interval, args.trail)
+    trajectory = load_trajectory(args.trajectory)
+    animate = animate_3d if args.dimension == "3d" else animate_2d
+    animate(trajectory, args.output, args.interval, args.trail)
 
 
 if __name__ == "__main__":
