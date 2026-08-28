@@ -1,5 +1,6 @@
 import argparse
 import struct
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -43,7 +44,7 @@ def save_or_show(animation, output):
         plt.show()
 
 
-def animate_2d(trajectory, output=None, interval=40, trail=0):
+def animate_2d(trajectory, output=None, interval=100, trail=0):
     fig, ax = plt.subplots(figsize=(8, 8))
     limits = axis_limits(trajectory[:, :, :2])
     ax.set(xlim=limits[0], ylim=limits[1], xlabel="x", ylabel="y", aspect="equal")
@@ -64,7 +65,7 @@ def animate_2d(trajectory, output=None, interval=40, trail=0):
     save_or_show(animation, output)
 
 
-def animate_3d(trajectory, output=None, interval=40, trail=0):
+def animate_3d(trajectory, output=None, interval=100, trail=0):
     fig = plt.figure(figsize=(9, 8))
     ax = fig.add_subplot(111, projection="3d")
     limits = axis_limits(trajectory)
@@ -92,13 +93,41 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize nbody trajectory.bin")
     parser.add_argument("trajectory", nargs="?", default="trajectory.bin")
     parser.add_argument("--output", help="GIF or MP4 output path")
-    parser.add_argument("--interval", type=int, default=40)
+    parser.add_argument("--time-log", help="visualization timing log path")
+    parser.add_argument("--fps", type=float, default=10.0,
+                        help="GIF/动画播放速度，默认约 10 帧/秒")
+    parser.add_argument("--interval", type=int, default=None,
+                        help="兼容参数：直接指定每帧毫秒数，会覆盖 --fps")
     parser.add_argument("--trail", type=int, default=20, help="number of previous frames in each trail; 0 disables trails")
     parser.add_argument("--dimension", choices=("2d", "3d"), default="3d")
     args = parser.parse_args()
+    if args.fps <= 0:
+        parser.error("--fps must be positive")
+    interval = args.interval if args.interval is not None else max(1, round(1000.0 / args.fps))
+    total_start = time.perf_counter()
     trajectory = load_trajectory(args.trajectory)
     animate = animate_3d if args.dimension == "3d" else animate_2d
-    animate(trajectory, args.output, args.interval, args.trail)
+    animate(trajectory, args.output, interval, args.trail)
+    elapsed = time.perf_counter() - total_start
+    if args.output:
+        log_path = Path(args.time_log) if args.time_log else Path(args.output).with_suffix(".visualization.log")
+        output_size = Path(args.output).stat().st_size if Path(args.output).exists() else 0
+        log_path.write_text(
+            "\n".join((
+                f"trajectory={args.trajectory}",
+                f"output={args.output}",
+                f"dimension={args.dimension}",
+                f"frames={len(trajectory)}",
+                f"particles={trajectory.shape[1]}",
+                f"requested_fps={args.fps}",
+                f"interval_ms={interval}",
+                f"output_size_bytes={output_size}",
+                f"visualization_total_sec={elapsed:.6f}",
+            )) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Visualization time: {elapsed:.3f} s")
+        print(f"Timing log: {log_path}")
 
 
 if __name__ == "__main__":

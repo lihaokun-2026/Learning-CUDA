@@ -1,6 +1,6 @@
 dt = 2e-3
-record_interval = 40
+record_interval = 1
 G = 1.0
 softening = 2e-2
 integrator = leapfrog
-num_steps = 4000
+num_steps = 1000

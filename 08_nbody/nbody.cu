@@ -258,13 +258,16 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpy(positions, host_positions.data(), n * sizeof(float4), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(velocities, host_velocities.data(), n * sizeof(float4), cudaMemcpyHostToDevice));
         const int blocks = (n + TILE_SIZE - 1) / TILE_SIZE;
+        double trajectory_copy_seconds = 0.0;
         auto record = [&](int index) {
+            const auto copy_start = std::chrono::steady_clock::now();
             CUDA_CHECK(cudaMemcpy(host_positions.data(), positions, n * sizeof(float4), cudaMemcpyDeviceToHost));
             for (int i = 0; i < n; ++i) {
                 trajectory[(static_cast<size_t>(i) * records + index) * 3 + 0] = host_positions[i].x;
                 trajectory[(static_cast<size_t>(i) * records + index) * 3 + 1] = host_positions[i].y;
                 trajectory[(static_cast<size_t>(i) * records + index) * 3 + 2] = host_positions[i].z;
             }
+            trajectory_copy_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_start).count();
         };
         record(0);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -307,7 +310,7 @@ int main(int argc, char** argv) {
                        host_positions[i].w};
          }
          const Diagnostics final_diagnostics = compute_diagnostics(final_bodies, params.G, params.softening);
-         const auto io_start = std::chrono::steady_clock::now();
+        const auto io_start = std::chrono::steady_clock::now();
          write_trajectory(output_path, n, records, trajectory);
          const double io_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - io_start).count();
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -336,6 +339,8 @@ int main(int argc, char** argv) {
              << "particles=" << n << "\nsteps=" << params.steps << "\nrecords=" << records << "\n"
              << "integrator=" << params.integrator << "\ndt=" << params.dt << "\n"
              << "gpu_simulation_sec=" << simulation_seconds << "\n"
+             << "gpu_kernel_compute_sec=" << simulation_seconds << "\n"
+             << "host_trajectory_copy_and_record_sec=" << trajectory_copy_seconds << "\n"
              << "wall_total_sec=" << seconds << "\ntrajectory_io_sec=" << io_seconds << "\n"
              << "average_step_ms=" << (gpu_milliseconds / std::max(params.steps, 1)) << "\n"
              << "particle_steps_per_sec=" << (simulation_seconds > 0 ? n * params.steps / simulation_seconds : 0) << "\n"

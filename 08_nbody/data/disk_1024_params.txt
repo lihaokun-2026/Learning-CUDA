@@ -1,5 +1,5 @@
 dt = 1e-4
-record_interval = 100
+record_interval = 1
 G = 1.0
 softening = 1e-4
 integrator = leapfrog

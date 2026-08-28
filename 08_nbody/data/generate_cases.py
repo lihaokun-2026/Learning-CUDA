@@ -4,6 +4,9 @@ Usage:
     python generate_cases.py
 
 The generated particle files use: x y z vx vy vz mass.
+
+Physical units for the galaxy cases:
+    position: light-years (ly), velocity: ly/Myr, mass: solar masses (Msun)
 """
 from pathlib import Path
 import math
@@ -11,35 +14,101 @@ import random
 
 ROOT = Path(__file__).parent
 
+# 1 km/s is approximately 1.0227 ly/Myr.  The values below describe a
+# Milky-Way-like stellar disk, not a precision astrophysical catalogue.
+GALAXY_G = 0.1559  # ly^3 / (Msun * Myr^2)
+GALAXY_RADIUS = 50000.0
+GALAXY_HALF_THICKNESS = 1500.0
+CENTRAL_BLACK_HOLE_MASS = 4.3e6
+
 
 def write_case(name, particles, params):
     (ROOT / f"{name}_particles.txt").write_text(
         "\n".join("{:.9g} {:.9g} {:.9g} {:.9g} {:.9g} {:.9g} {:.9g}".format(*p) for p in particles) + "\n",
         encoding="utf-8",
     )
-
-
-def write_large_disk(name, count, params, seed):
-    """Stream a stable 3D disk around a massive central body."""
-    rng = random.Random(seed)
-    path = ROOT / f"{name}_particles.txt"
-    with path.open("w", encoding="utf-8") as output:
-        # The central body prevents the equal-mass disk from collapsing under
-        # its own gravity and makes the benchmark visually interpretable.
-        output.write("0 0 0 0 0 0 1000\n")
-        for _ in range(count - 1):
-            radius = 0.5 + 9.5 * math.sqrt(rng.random())
-            angle = 2 * math.pi * rng.random()
-            z = rng.gauss(0, 0.03)
-            speed = math.sqrt(1000.0 / radius)
-            values = (radius * math.cos(angle), radius * math.sin(angle), z,
-                      -speed * math.sin(angle), speed * math.cos(angle),
-                      rng.gauss(0, 0.002), 1.0e-4)
-            output.write("{:.9g} {:.9g} {:.9g} {:.9g} {:.9g} {:.9g} {:.9g}\n".format(*values))
     (ROOT / f"{name}_params.txt").write_text(
         "\n".join(f"{key} = {value}" for key, value in params.items()) + "\n",
         encoding="utf-8",
     )
+
+
+def population_counts(count):
+    """Return deterministic counts for the five hierarchical object types."""
+    compact = max(2, round(count * 0.002))
+    stars = max(1, round(count * 0.01))
+    planets = max(1, round(count * 0.15))
+    black_holes = 1
+    neutron_white = compact
+    asteroids = count - black_holes - neutron_white - stars - planets
+    if asteroids < 1:
+        raise ValueError("count is too small for the object population")
+    return {
+        "black_hole": black_holes,
+        "neutron_star_white_dwarf": neutron_white,
+        "star": stars,
+        "planet": planets,
+        "asteroid": asteroids,
+    }
+
+
+def random_mass(object_type, rng):
+    """Sample astrophysical masses in solar masses (Msun)."""
+    ranges = {
+        "black_hole": (4.3e6, 4.3e6),
+        "neutron_star_white_dwarf": (0.5, 2.3),
+        "star": (0.08, 100.0),
+        "planet": (1.0e-8, 1.0e-3),
+        "asteroid": (1.0e-15, 1.0e-8),
+    }
+    low, high = ranges[object_type]
+    return low if low == high else 10.0 ** rng.uniform(math.log10(low), math.log10(high))
+
+
+def write_random_population(name, count, params, seed):
+    """Stream a reproducible Milky-Way-scale random stellar population.
+
+    The disk has a 100,000 ly diameter and a 3,000 ly thickness.  Position
+    samples are random in the disk volume. Velocities have random radial,
+    vertical and tangential components around the circular velocity generated
+    by the central black hole. A full Milky-Way rotation curve would require
+    an additional stellar/dark-matter potential, which is not an explicit
+    particle in this direct N-body benchmark.
+    """
+    rng = random.Random(seed)
+    path = ROOT / f"{name}_particles.txt"
+    metadata_path = ROOT / f"{name}_objects.txt"
+    counts = population_counts(count)
+    object_types = [kind for kind, number in counts.items() for _ in range(number)]
+    rng.shuffle(object_types)
+    masses = []
+    with path.open("w", encoding="utf-8") as output:
+        for index, object_type in enumerate(object_types):
+            mass = random_mass(object_type, rng)
+            if object_type == "black_hole":
+                # The Milky Way's central black hole is the one intentional
+                # non-random position; this avoids an arbitrary off-centre
+                # 4.3-million-solar-mass attractor.
+                values = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, mass)
+            else:
+                radius = 100.0 + (GALAXY_RADIUS - 100.0) * math.sqrt(rng.random())
+                angle = rng.uniform(0.0, 2.0 * math.pi)
+                x = radius * math.cos(angle)
+                y = radius * math.sin(angle)
+                z = rng.uniform(-GALAXY_HALF_THICKNESS, GALAXY_HALF_THICKNESS)
+                circular = math.sqrt(GALAXY_G * CENTRAL_BLACK_HOLE_MASS / radius)
+                radial = rng.gauss(0.0, 0.30 * circular)
+                tangential = circular * rng.uniform(0.80, 1.20)
+                vertical = rng.gauss(0.0, 0.15 * circular)
+                vx = radial * math.cos(angle) - tangential * math.sin(angle)
+                vy = radial * math.sin(angle) + tangential * math.cos(angle)
+                values = (x, y, z, vx, vy, vertical, mass)
+            masses.append(mass)
+            output.write("{:.9g} {:.9g} {:.9g} {:.9g} {:.9g} {:.9g} {:.9g}\n".format(*values))
+    with metadata_path.open("w", encoding="utf-8") as metadata:
+        metadata.write("index type mass\n")
+        for index, object_type in enumerate(object_types):
+            metadata.write(f"{index} {object_type} {masses[index]:.9g}\n")
     (ROOT / f"{name}_params.txt").write_text(
         "\n".join(f"{key} = {value}" for key, value in params.items()) + "\n",
         encoding="utf-8",
@@ -114,8 +183,10 @@ write_case("solar_system", solar_system(), {**COMMON, "dt": "1e-4", "num_steps":
 write_case("cluster_64", cluster(), {**COMMON, "dt": "2e-4", "num_steps": "1000"})
 write_case("plummer_256", plummer_sphere(), {**COMMON, "dt": "2e-3", "num_steps": "1000", "softening": "2e-2"})
 write_case("disk_1024", disk(), {**COMMON, "dt": "1e-4", "num_steps": "1000"})
-write_large_disk("benchmark_4096", 4096,
-                 {**COMMON, "dt": "1e-3", "num_steps": "1000", "softening": "1e-2"}, 41)
-write_large_disk("benchmark_65536", 65536,
-                 {**COMMON, "dt": "1e-3", "num_steps": "1000", "softening": "1e-2"}, 43)
+write_random_population("benchmark_4096", 4096,
+                        {"dt": "0.01", "record_interval": "1", "G": str(GALAXY_G),
+                         "num_steps": "1000", "softening": "1.0", "integrator": "leapfrog"}, 41)
+write_random_population("benchmark_65536", 65536,
+                        {"dt": "0.01", "record_interval": "1", "G": str(GALAXY_G),
+                         "num_steps": "1000", "softening": "1.0", "integrator": "leapfrog"}, 43)
 print("Generated validation cases plus benchmark_4096 and benchmark_65536 in", ROOT)
