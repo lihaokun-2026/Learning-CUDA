@@ -92,26 +92,7 @@ python -m pip install numpy matplotlib
 
 生成 MP4 需要系统安装 FFmpeg：`python visualize.py trajectory.bin --output trajectory.mp4`。
 
-## 正确性测试
-
-Linux 编译和验收命令：
-
-```bash
-# 编译nbody
-nvcc -std=c++17 -lineinfo -arch=sm_89 nbody.cu -o nbody
-# 测试 两个粒子
-./nbody data/two_body_particles.txt data/two_body_params.txt two_body.bin two_body.log
-# 测试 4096个粒子
-./nbody data/benchmark_4096_particles.txt data/benchmark_4096_params.txt benchmark_4096.bin benchmark_4096.log
-# 测试 65536个粒子
-./nbody data/benchmark_65536_particles.txt data/benchmark_65536_params.txt benchmark_65536.bin benchmark_65536.log
-```
-
-RTX 4090 对应 `sm_89`。如果可执行文件需要在其他 GPU 上运行，可使用 `-gencode` 同时嵌入多个架构，或省略 `-arch=sm_89` 使用 nvcc 默认目标。
-
-### 正确性验收
-
-### Linux 完整测试与计时流程
+## Linux 测试、正确性验收与计时流程
 
 以下命令在有 NVIDIA GPU、CUDA Toolkit 和 Python 环境的 Linux 机器上执行：
 
@@ -132,17 +113,21 @@ nvcc -O3 -std=c++17 -lineinfo -arch=sm_89 nbody.cu -o nbody
 ./nbody data/two_body_particles.txt data/two_body_params.txt \
 	two_body.bin two_body.performance.log
 
+# 检查双体系统的守恒误差
+grep -E 'relative_momentum_error|relative_energy_error|gpu_kernel_compute_sec|wall_total_sec' \
+	two_body.performance.log
+
 # 5. 运行 4096 粒子性能案例
 ./nbody data/benchmark_4096_particles.txt data/benchmark_4096_params.txt \
-	benchmark_4096.bin benchmark_4096.performance.log
+    benchmark_4096.bin benchmark_4096.performance.log
 
 # 6. 读取 CUDA 程序的性能日志
 grep -E 'gpu_kernel_compute_sec|host_trajectory_copy|trajectory_io_sec|wall_total_sec|interactions_per_sec' \
-	benchmark_4096.performance.log
+    benchmark_4096.performance.log
 
 # 7. 生成 10 FPS 三维 GIF；程序结束时会打印生成耗时
 python3 visualize.py benchmark_4096.bin --dimension 3d --fps 10 --trail 10 \
-	--output benchmark_4096.gif --time-log benchmark_4096.visualization.log
+    --output benchmark_4096.gif --time-log benchmark_4096.visualization.log
 
 # 8. 读取 GIF 生成耗时
 cat benchmark_4096.visualization.log
@@ -169,17 +154,18 @@ cat benchmark_4096.visualization.log
 
 ```bash
 ./nbody data/benchmark_65536_particles.txt data/benchmark_65536_params.txt \
-	benchmark_65536.bin benchmark_65536.performance.log
+    benchmark_65536.bin benchmark_65536.performance.log
 python3 visualize.py benchmark_65536.bin --dimension 3d --fps 10 --trail 0 \
-	--output benchmark_65536.gif --time-log benchmark_65536.visualization.log
+    --output benchmark_65536.gif --time-log benchmark_65536.visualization.log
 ```
 
 双体系统运行后检查动画是否保持近似圆轨道，同时检查 `two_body.log` 的 `relative_energy_error` 和 `relative_momentum_error`。Leapfrog 的误差应保持有界；具体阈值取决于 `dt` 和软化参数，建议双体案例两项误差均不超过 $10^{-3}$。多体系统重点检查动量误差；采样能量适合观察趋势，不应作为严格精确阈值。
 
 ```bash
-	python3 visualize.py two_body.bin --dimension 3d --fps 10 --trail 20 --output two_body.gif
-cat two_body.log
-cat benchmark_4096.log
+python3 visualize.py two_body.bin --dimension 3d --fps 10 --trail 20 \
+    --output two_body.gif --time-log two_body.visualization.log
+cat two_body.performance.log
+cat benchmark_4096.performance.log
 ```
 
 ### nvcc 弃用警告
