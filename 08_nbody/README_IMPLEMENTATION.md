@@ -120,6 +120,19 @@ python3 visualize.py benchmark_4096.bin \
 80 个时间帧的三维运动路径。65536 粒子时只对小行星抽样显示，避免 Matplotlib 创建
 数万条独立轨迹线导致画面糊成一片，但 BIN 中仍保留全部粒子和全部帧。
 
+在没有图形桌面的 A800 服务器上，Matplotlib 需要使用无窗口后端保存 MP4：
+
+```bash
+MPLBACKEND=Agg python3 visualize.py benchmark_4096.bin \
+    --backend matplotlib --dimension 3d \
+    --objects data/benchmark_4096_objects.txt \
+    --fps 10 --trail 80 --z-scale 35 \
+    --output benchmark_4096_matplotlib.mp4
+```
+
+`MPLBACKEND=Agg` 只关闭交互窗口，不会改变 `Axes3D`、`FuncAnimation` 或三维轨迹
+绘制逻辑；输出完成后可将 MP4 下载到本地查看。
+
 `--backend gpu` 是面向大规模输出的性能模式：它使用 CUDA 投影和 FFmpeg 生成
 栅格化 MP4，不满足“Matplotlib 3D + FuncAnimation”这一验收条件。两种模式可以
 同时保留，前者用于题目展示，后者用于高分辨率性能输出。

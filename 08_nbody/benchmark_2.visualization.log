@@ -1,9 +1,0 @@
-trajectory=two_body.bin
-output=benchmark_2.gif
-dimension=3d
-frames=1001
-particles=2
-requested_fps=10.0
-interval_ms=100
-output_size_bytes=48779362
-visualization_total_sec=145.070589

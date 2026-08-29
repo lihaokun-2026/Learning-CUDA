@@ -1,9 +1,0 @@
-trajectory=benchmark_4096.bin
-output=benchmark_4096.gif
-dimension=3d
-frames=1001
-particles=4096
-requested_fps=10.0
-interval_ms=100
-output_size_bytes=104270807
-visualization_total_sec=1593.813499

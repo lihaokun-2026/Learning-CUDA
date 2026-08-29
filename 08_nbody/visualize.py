@@ -136,8 +136,11 @@ def animate_3d(trajectory, object_types=None, output=None, interval=100, trail=0
     trail_indices = np.linspace(0, len(selected) - 1, trail_count, dtype=int)
     trail_collection = None
     if trail_indices.size:
+        initial_points = display[0, trail_indices]
+        initial_segments = np.stack((initial_points, initial_points), axis=1)
         trail_collection = Line3DCollection([], colors="#8ab4f8", linewidths=0.65,
                                             alpha=0.58)
+        trail_collection.set_segments(initial_segments)
         ax.add_collection3d(trail_collection)
     legend_items = [
         Line2D([0], [0], marker="o", color="none", label=kind.replace("_", " "),
