@@ -3,7 +3,7 @@
 ## 文件
 
 - `nbody.cu`：CUDA 实现。使用共享内存分块计算 $O(N^2)$ 引力，并支持 Euler 与 Leapfrog 积分。
-- `visualize.py`：读取二进制轨迹；优先使用 PyTorch CUDA 固定视角栅格化并通过 FFmpeg 流式生成高质量 MP4，也保留 GIF 和 Matplotlib 兼容后端。
+- `visualize.py`：读取二进制轨迹；默认使用 Matplotlib `Axes3D` + `FuncAnimation` 绘制三维动态轨迹，也提供显式 `--backend gpu` 的高性能栅格化 MP4 后端。
 - `data/particles.txt`、`data/params.txt`：最小三体回归样例。
 - `data/generate_cases.py`：生成多组确定性测试数据。
 
@@ -97,6 +97,32 @@ python -m pip install numpy matplotlib
 ```
 
 生成 MP4 需要系统安装 FFmpeg：`python visualize.py trajectory.bin --output trajectory.mp4`。
+
+### Matplotlib 三维动画（题目验收模式）
+
+题目要求的三维动态轨迹必须使用 Matplotlib 实现，因此验收时使用
+`--backend matplotlib --dimension 3d`，不要用 GPU 栅格化后端替代它：
+
+```bash
+python3 visualize.py benchmark_4096.bin \
+    --backend matplotlib --dimension 3d \
+    --objects data/benchmark_4096_objects.txt \
+    --fps 10 --trail 80 --z-scale 35 \
+    --output benchmark_4096_matplotlib.mp4
+```
+
+该模式确实创建 `projection="3d"` 的 Matplotlib 坐标轴，并通过
+`FuncAnimation` 逐帧更新五类天体的三维坐标。`z` 轴按显示比例放大，仅用于克服
+银河盘半径约 50,000 ly、半厚度约 1,500 ly 的尺度差异；数据本身不被改变。
+颜色和大小分别表示黑洞、中子星/白矮星、恒星、行星和小行星；三维尾迹使用
+`Line3DCollection` 批量绘制，4096 粒子最多显示 1024 条轨迹，65536 粒子最多显示
+512 条轨迹。尾迹长度由 `--trail` 控制，例如 `--trail 80` 会显示每个代表粒子最近
+80 个时间帧的三维运动路径。65536 粒子时只对小行星抽样显示，避免 Matplotlib 创建
+数万条独立轨迹线导致画面糊成一片，但 BIN 中仍保留全部粒子和全部帧。
+
+`--backend gpu` 是面向大规模输出的性能模式：它使用 CUDA 投影和 FFmpeg 生成
+栅格化 MP4，不满足“Matplotlib 3D + FuncAnimation”这一验收条件。两种模式可以
+同时保留，前者用于题目展示，后者用于高分辨率性能输出。
 
 ## Linux 完整测试、正确性验收与计时流程
 
@@ -198,9 +224,6 @@ Leapfrog 误差应保持有界，建议双体案例的 `relative_energy_error` �
 记录程序端到端时间、CPU 时间和最大常驻内存：
 
 ```bash
-/usr/bin/time \
-    -f 'process_wall_sec=%e\nuser_sec=%U\nsystem_sec=%S\nmax_rss_kb=%M' \
-    -o benchmark_4096.process.time \
     ./nbody \
     data/benchmark_4096_particles.txt \
     data/benchmark_4096_params.txt \

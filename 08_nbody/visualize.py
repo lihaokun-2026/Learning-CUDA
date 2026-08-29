@@ -81,33 +81,94 @@ def animate_2d(trajectory, output=None, interval=100, trail=0, dpi=120):
     save_or_show(animation, output, dpi)
 
 
-def animate_3d(trajectory, output=None, interval=100, trail=0, dpi=120, z_scale=1.0):
+def animate_3d(trajectory, object_types=None, output=None, interval=100, trail=0,
+               dpi=120, z_scale=1.0):
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
+    from matplotlib.lines import Line2D
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
-    fig = plt.figure(figsize=(9, 8))
+    particles = trajectory.shape[1]
+    if object_types is None:
+        object_types = np.full(particles, "asteroid", dtype=object)
+    draw_limit = 14000 if particles > 20000 else particles
+    selected_groups = []
+    for kind in OBJECT_STYLE:
+        indices = np.flatnonzero(object_types == kind)
+        if kind == "asteroid" and len(indices) > draw_limit:
+            indices = indices[np.linspace(0, len(indices) - 1, draw_limit, dtype=int)]
+        selected_groups.append(indices)
+    selected = np.unique(np.concatenate(selected_groups))
+    display = trajectory[:, selected].astype(np.float32, copy=True)
+    display[:, :, 2] *= z_scale
+
+    limit_frames = np.linspace(0, len(display) - 1, min(len(display), 101), dtype=int)
+    limit_particles = np.linspace(0, len(selected) - 1,
+                                  min(len(selected), 20000), dtype=int)
+    limits = axis_limits(display[np.ix_(limit_frames, limit_particles)])
+
+    fig = plt.figure(figsize=(11, 9), facecolor="#10131a")
     ax = fig.add_subplot(111, projection="3d")
-    plotted = trajectory.copy()
-    plotted[:, :, 2] *= z_scale
-    limits = axis_limits(plotted)
-    ax.set(xlim=limits[0], ylim=limits[1], zlim=limits[2], xlabel="x", ylabel="y", zlabel="z")
-    ax.set_box_aspect((1, 1, 1))
-    points = ax.scatter([], [], [], s=14, alpha=0.85)
-    trails = [ax.plot([], [], [], "-", lw=0.7, alpha=0.35)[0] for _ in range(trajectory.shape[1])] if trail else []
-    title = ax.set_title("")
+    ax.set(xlim=limits[0], ylim=limits[1], zlim=limits[2], xlabel="x", ylabel="y",
+           zlabel=f"z (visual × {z_scale:g})")
+    ax.set_box_aspect((1, 1, 0.85))
+    ax.view_init(elev=28, azim=38)
+    ax.set_facecolor("#10131a")
+    ax.grid(True, alpha=0.22)
+    title = ax.set_title("", color="white", pad=18, fontsize=13)
+
+    selected_types = object_types[selected]
+    scatters = {}
+    for kind, (color, size) in OBJECT_STYLE.items():
+        local = np.flatnonzero(selected_types == kind)
+        if len(local):
+            rgb = tuple(component / 255.0 for component in color)
+            scatters[kind] = ax.scatter(
+                display[0, local, 0], display[0, local, 1], display[0, local, 2],
+                s=max(2.0, size * size * 0.75), c=[rgb],
+                alpha=0.85 if kind != "asteroid" else 0.38,
+                depthshade=True, edgecolors="none")
+
+    # Batch all trail segments in one 3D collection. This shows substantially
+    # more particle trajectories without creating one expensive Line3D object
+    # per particle. Every body is still simulated and stored in the BIN file.
+    trail_count = min(1024 if particles <= 20000 else 512, len(selected)) if trail else 0
+    trail_indices = np.linspace(0, len(selected) - 1, trail_count, dtype=int)
+    trail_collection = None
+    if trail_indices.size:
+        trail_collection = Line3DCollection([], colors="#8ab4f8", linewidths=0.65,
+                                            alpha=0.58)
+        ax.add_collection3d(trail_collection)
+    legend_items = [
+        Line2D([0], [0], marker="o", color="none", label=kind.replace("_", " "),
+               markerfacecolor=np.array(color) / 255.0, markersize=max(4, size + 1))
+        for kind, (color, size) in OBJECT_STYLE.items() if kind in scatters
+    ]
+    ax.legend(handles=legend_items, loc="upper left", fontsize=8,
+              facecolor="#202631", labelcolor="white", framealpha=0.85)
 
     def update(frame):
         start = max(0, frame - trail) if trail else frame
-        visible = plotted[start:frame + 1]
-        points._offsets3d = (visible[-1, :, 0], visible[-1, :, 1], visible[-1, :, 2])
-        for particle, line in enumerate(trails):
-            line.set_data_3d(visible[:, particle, 0], visible[:, particle, 1], visible[:, particle, 2])
-        ax.view_init(elev=25, azim=35)
-        title.set_text(f"N-body 3D — frame {frame + 1}/{len(trajectory)}")
-        return (points, title, *trails)
+        for kind, points in scatters.items():
+            local = np.flatnonzero(selected_types == kind)
+            current = display[frame, local]
+            points._offsets3d = (current[:, 0], current[:, 1], current[:, 2])
+        if trail_collection is not None:
+            history = display[start:frame + 1, trail_indices]
+            if len(history) > 1:
+                segments = np.stack((history[:-1], history[1:]), axis=2)
+                trail_collection.set_segments(segments.reshape(-1, 2, 3))
+            else:
+                trail_collection.set_segments([])
+        title.set_text(f"N-body 3D · frame {frame + 1}/{len(trajectory)} · "
+                       f"显示 {len(selected):,}/{particles:,} 个天体 · "
+                       f"轨迹 {len(trail_indices):,} 条")
+        animated = (*scatters.values(), title)
+        return animated + ((trail_collection,) if trail_collection is not None else ())
 
     animation = FuncAnimation(fig, update, frames=len(trajectory), interval=interval, blit=False)
     save_or_show(animation, output, dpi)
+    plt.close(fig)
 
 
 def find_objects_file(trajectory_path, explicit_path=None):
@@ -308,7 +369,7 @@ def main():
                         help="GIF/动画播放速度，默认约 10 帧/秒")
     parser.add_argument("--interval", type=int, default=None,
                         help="兼容参数：直接指定每帧毫秒数，会覆盖 --fps")
-    parser.add_argument("--trail", type=int, default=20, help="number of previous frames in each trail; 0 disables trails")
+    parser.add_argument("--trail", type=int, default=80, help="number of previous frames in each 3D trail; 0 disables trails")
     parser.add_argument("--dimension", choices=("2d", "3d"), default="3d")
     parser.add_argument("--z-scale", type=float, default=35.0,
                         help="visual-only vertical exaggeration for fixed 3D projection")
@@ -337,12 +398,10 @@ def main():
         output_frames += 1
     backend = args.backend
     if backend == "auto":
-        try:
-            import torch
-            backend = "gpu" if (args.output and Path(args.output).suffix.lower() in (".mp4", ".gif")
-                                and torch.cuda.is_available() and shutil.which("ffmpeg")) else "matplotlib"
-        except ImportError:
-            backend = "matplotlib"
+        # Matplotlib is the default because it is the required, inspectable
+        # FuncAnimation 3D implementation. Use --backend gpu explicitly for
+        # the high-throughput rasterized video path.
+        backend = "matplotlib"
     gpu_render_sec = 0.0
     encode_sec = 0.0
     selected_encoder = "matplotlib"
@@ -357,7 +416,8 @@ def main():
     else:
         animate = animate_3d if args.dimension == "3d" else animate_2d
         if args.dimension == "3d":
-            animate(trajectory, args.output, interval, args.trail, args.dpi, args.z_scale)
+            animate(trajectory, object_types, args.output, interval, args.trail,
+                    args.dpi, args.z_scale)
         else:
             animate(trajectory, args.output, interval, args.trail, args.dpi)
     elapsed = time.perf_counter() - total_start
