@@ -1,0 +1,9 @@
+trajectory=benchmark_65536.bin
+output=benchmark_65536.gif
+dimension=3d
+frames=1001
+particles=65536
+requested_fps=10.0
+interval_ms=100
+output_size_bytes=52691451
+visualization_total_sec=23749.825908
