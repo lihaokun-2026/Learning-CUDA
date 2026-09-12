@@ -2,6 +2,7 @@
 
 Usage:
     python generate_cases.py
+    python generate_cases.py --case benchmark_4096 --output-dir data
 
 The generated particle files use: x y z vx vy vz mass.
 
@@ -9,12 +10,16 @@ Physical units for the galaxy cases:
     position: light-years (ly), velocity: ly/Myr, mass: solar masses (Msun)
 """
 from pathlib import Path
+import argparse
+import hashlib
+import json
 import math
+import platform
 import random
 
 ROOT = Path(__file__).parent
 
-# 1 km/s is approximately 1.0227 ly/Myr.  The values below describe a
+# 1 km/s is approximately 3.3356 ly/Myr.  The values below describe a
 # Milky-Way-like stellar disk, not a precision astrophysical catalogue.
 GALAXY_G = 0.1559  # ly^3 / (Msun * Myr^2)
 GALAXY_RADIUS = 50000.0
@@ -22,12 +27,12 @@ GALAXY_HALF_THICKNESS = 1500.0
 CENTRAL_BLACK_HOLE_MASS = 4.3e6
 
 
-def write_case(name, particles, params):
-    (ROOT / f"{name}_particles.txt").write_text(
+def write_case(name, particles, params, output_dir=ROOT):
+    (output_dir / f"{name}_particles.txt").write_text(
         "\n".join("{:.9g} {:.9g} {:.9g} {:.9g} {:.9g} {:.9g} {:.9g}".format(*p) for p in particles) + "\n",
         encoding="utf-8",
     )
-    (ROOT / f"{name}_params.txt").write_text(
+    (output_dir / f"{name}_params.txt").write_text(
         "\n".join(f"{key} = {value}" for key, value in params.items()) + "\n",
         encoding="utf-8",
     )
@@ -65,7 +70,7 @@ def random_mass(object_type, rng):
     return low if low == high else 10.0 ** rng.uniform(math.log10(low), math.log10(high))
 
 
-def write_random_population(name, count, params, seed):
+def write_random_population(name, count, params, seed, output_dir=ROOT):
     """Stream a reproducible Milky-Way-scale random stellar population.
 
     The disk has a 100,000 ly diameter and a 3,000 ly thickness.  Position
@@ -76,13 +81,13 @@ def write_random_population(name, count, params, seed):
     particle in this direct N-body benchmark.
     """
     rng = random.Random(seed)
-    path = ROOT / f"{name}_particles.txt"
-    metadata_path = ROOT / f"{name}_objects.txt"
+    path = output_dir / f"{name}_particles.txt"
+    metadata_path = output_dir / f"{name}_objects.txt"
     counts = population_counts(count)
     object_types = [kind for kind, number in counts.items() for _ in range(number)]
     rng.shuffle(object_types)
     masses = []
-    with path.open("w", encoding="utf-8") as output:
+    with path.open("w", encoding="utf-8", newline="\n") as output:
         for index, object_type in enumerate(object_types):
             mass = random_mass(object_type, rng)
             if object_type == "black_hole":
@@ -105,14 +110,26 @@ def write_random_population(name, count, params, seed):
                 values = (x, y, z, vx, vy, vertical, mass)
             masses.append(mass)
             output.write("{:.9g} {:.9g} {:.9g} {:.9g} {:.9g} {:.9g} {:.9g}\n".format(*values))
-    with metadata_path.open("w", encoding="utf-8") as metadata:
+    with metadata_path.open("w", encoding="utf-8", newline="\n") as metadata:
         metadata.write("index type mass\n")
         for index, object_type in enumerate(object_types):
             metadata.write(f"{index} {object_type} {masses[index]:.9g}\n")
-    (ROOT / f"{name}_params.txt").write_text(
-        "\n".join(f"{key} = {value}" for key, value in params.items()) + "\n",
-        encoding="utf-8",
-    )
+    with (output_dir / f"{name}_params.txt").open("w", encoding="utf-8", newline="\n") as output:
+        output.write("\n".join(f"{key} = {value}" for key, value in params.items()) + "\n")
+    manifest = {
+        "case": name, "particle_count": count, "seed": seed,
+        "python_version": platform.python_version(),
+        "generator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "units": {"position": "ly", "velocity": "ly/Myr", "mass": "Msun", "time": "Myr"},
+        "population_counts": counts, "parameters": params,
+        "expected_records": int(params["num_steps"]) // int(params["record_interval"]) + 1,
+        "sha256": {f"{name}_{suffix}.txt": hashlib.sha256(
+            (output_dir / f"{name}_{suffix}.txt").read_bytes()).hexdigest()
+            for suffix in ("particles", "params", "objects")},
+    }
+    (output_dir / f"{name}_manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Generated {name}: particles={count}, seed={seed}, records={manifest['expected_records']}")
 
 
 def two_body():
@@ -178,15 +195,37 @@ def disk(count=1024, seed=11):
 
 
 COMMON = {"dt": "1e-3", "record_interval": "1", "G": "1.0", "softening": "1e-4", "integrator": "leapfrog"}
-write_case("two_body", two_body(), {**COMMON, "num_steps": "1000"})
-write_case("solar_system", solar_system(), {**COMMON, "dt": "1e-4", "num_steps": "1000"})
-write_case("cluster_64", cluster(), {**COMMON, "dt": "2e-4", "num_steps": "1000"})
-write_case("plummer_256", plummer_sphere(), {**COMMON, "dt": "2e-3", "num_steps": "1000", "softening": "2e-2"})
-write_case("disk_1024", disk(), {**COMMON, "dt": "1e-4", "num_steps": "1000"})
-write_random_population("benchmark_4096", 4096,
-                        {"dt": "0.01", "record_interval": "1", "G": str(GALAXY_G),
-                         "num_steps": "1000", "softening": "1.0", "integrator": "leapfrog"}, 41)
-write_random_population("benchmark_65536", 65536,
-                        {"dt": "0.01", "record_interval": "1", "G": str(GALAXY_G),
-                         "num_steps": "1000", "softening": "1.0", "integrator": "leapfrog"}, 43)
-print("Generated validation cases plus benchmark_4096 and benchmark_65536 in", ROOT)
+SMALL_CASES = {
+    "two_body": (two_body, {**COMMON, "num_steps": "1000"}),
+    "solar_system": (solar_system, {**COMMON, "dt": "1e-4", "num_steps": "1000"}),
+    "cluster_64": (cluster, {**COMMON, "dt": "2e-4", "num_steps": "1000"}),
+    "plummer_256": (plummer_sphere, {**COMMON, "dt": "2e-3", "num_steps": "1000", "softening": "2e-2"}),
+    "disk_1024": (disk, {**COMMON, "dt": "1e-4", "num_steps": "1000"}),
+}
+BENCHMARKS = {"benchmark_4096": (4096, 41), "benchmark_65536": (65536, 43)}
+BENCHMARK_PARAMS = {"dt": "0.01", "record_interval": "1", "G": str(GALAXY_G),
+                    "num_steps": "1000", "softening": "1.0", "integrator": "leapfrog"}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--case", choices=["all", *SMALL_CASES, *BENCHMARKS], default="all",
+                        help="Generate only this case; default: all (legacy behavior).")
+    parser.add_argument("--output-dir", type=Path, default=ROOT,
+                        help="Destination directory; default: directory containing this script.")
+    args = parser.parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    names = [*SMALL_CASES, *BENCHMARKS] if args.case == "all" else [args.case]
+    for name in names:
+        if name in BENCHMARKS:
+            count, seed = BENCHMARKS[name]
+            write_random_population(name, count, BENCHMARK_PARAMS, seed, args.output_dir)
+        else:
+            factory, params = SMALL_CASES[name]
+            write_case(name, factory(), params, args.output_dir)
+            print(f"Generated {name}")
+    print("Output directory:", args.output_dir.resolve())
+
+
+if __name__ == "__main__":
+    main()

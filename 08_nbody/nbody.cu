@@ -161,30 +161,41 @@ __global__ void acceleration_kernel(const float4* positions, float4* acceleratio
     if (active) acceleration[i] = make_float4(ax, ay, az, 0.0f);
 }
 
-__global__ void euler_kernel(float4* positions, float4* velocities,
+__global__ void euler_kernel(float4* positions, double4* precise_positions, double4* velocities,
                              const float4* acceleration, int n, float dt) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float4 p = positions[i], v = velocities[i], a = acceleration[i];
-    v.x += a.x * dt; v.y += a.y * dt; v.z += a.z * dt;
+    double4 p = precise_positions[i], v = velocities[i];
+    const float4 a = acceleration[i];
+    v.x += static_cast<double>(a.x) * dt;
+    v.y += static_cast<double>(a.y) * dt;
+    v.z += static_cast<double>(a.z) * dt;
     p.x += v.x * dt; p.y += v.y * dt; p.z += v.z * dt;
-    velocities[i] = v; positions[i] = p;
+    velocities[i] = v; precise_positions[i] = p;
+    positions[i] = make_float4(static_cast<float>(p.x), static_cast<float>(p.y),
+                              static_cast<float>(p.z), positions[i].w);
 }
 
-__global__ void kick_kernel(float4* velocities, const float4* acceleration, int n, float dt) {
+__global__ void kick_kernel(double4* velocities, const float4* acceleration, int n, float dt) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    velocities[i].x += acceleration[i].x * dt;
-    velocities[i].y += acceleration[i].y * dt;
-    velocities[i].z += acceleration[i].z * dt;
+    velocities[i].x += static_cast<double>(acceleration[i].x) * dt;
+    velocities[i].y += static_cast<double>(acceleration[i].y) * dt;
+    velocities[i].z += static_cast<double>(acceleration[i].z) * dt;
 }
 
-__global__ void drift_kernel(float4* positions, const float4* velocities, int n, float dt) {
+__global__ void drift_kernel(float4* positions, double4* precise_positions,
+                             const double4* velocities, int n, float dt) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    positions[i].x += velocities[i].x * dt;
-    positions[i].y += velocities[i].y * dt;
-    positions[i].z += velocities[i].z * dt;
+    // Preserve sub-ULP drifts at large coordinates instead of rounding every step.
+    double4 p = precise_positions[i];
+    p.x += velocities[i].x * dt;
+    p.y += velocities[i].y * dt;
+    p.z += velocities[i].z * dt;
+    precise_positions[i] = p;
+    positions[i] = make_float4(static_cast<float>(p.x), static_cast<float>(p.y),
+                              static_cast<float>(p.z), positions[i].w);
 }
 
 static void read_particles(const std::string& path, std::vector<Body>& bodies) {
@@ -246,17 +257,22 @@ int main(int argc, char** argv) {
         const int records = params.steps / params.record_interval + 1;
         const Diagnostics initial_diagnostics = compute_diagnostics(bodies, params.G, params.softening);
         std::vector<float> trajectory(static_cast<size_t>(records) * n * 3);
-        std::vector<float4> host_positions(n), host_velocities(n);
+        std::vector<float4> host_positions(n);
+        std::vector<double4> host_precise_positions(n), host_velocities(n);
         for (int i = 0; i < n; ++i) {
             host_positions[i] = make_float4(bodies[i].x, bodies[i].y, bodies[i].z, bodies[i].mass);
-            host_velocities[i] = make_float4(bodies[i].vx, bodies[i].vy, bodies[i].vz, 0);
+            host_precise_positions[i] = make_double4(bodies[i].x, bodies[i].y, bodies[i].z, bodies[i].mass);
+            host_velocities[i] = make_double4(bodies[i].vx, bodies[i].vy, bodies[i].vz, 0);
         }
-        float4 *positions = nullptr, *velocities = nullptr, *acceleration = nullptr;
+        float4 *positions = nullptr, *acceleration = nullptr;
+        double4 *precise_positions = nullptr, *velocities = nullptr;
         CUDA_CHECK(cudaMalloc(&positions, n * sizeof(float4)));
-        CUDA_CHECK(cudaMalloc(&velocities, n * sizeof(float4)));
+        CUDA_CHECK(cudaMalloc(&velocities, n * sizeof(double4)));
+        CUDA_CHECK(cudaMalloc(&precise_positions, n * sizeof(double4)));
         CUDA_CHECK(cudaMalloc(&acceleration, n * sizeof(float4)));
         CUDA_CHECK(cudaMemcpy(positions, host_positions.data(), n * sizeof(float4), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(velocities, host_velocities.data(), n * sizeof(float4), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(precise_positions, host_precise_positions.data(), n * sizeof(double4), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(velocities, host_velocities.data(), n * sizeof(double4), cudaMemcpyHostToDevice));
         const int blocks = (n + TILE_SIZE - 1) / TILE_SIZE;
         double trajectory_copy_seconds = 0.0;
         auto record = [&](int index) {
@@ -286,9 +302,9 @@ int main(int argc, char** argv) {
         for (int step = 1; step <= params.steps; ++step) {
             if (params.integrator == "euler") {
                 acceleration_kernel<<<blocks, TILE_SIZE>>>(positions, acceleration, n, params.G, params.softening * params.softening);
-                euler_kernel<<<blocks, TILE_SIZE>>>(positions, velocities, acceleration, n, params.dt);
+                euler_kernel<<<blocks, TILE_SIZE>>>(positions, precise_positions, velocities, acceleration, n, params.dt);
             } else {
-                drift_kernel<<<blocks, TILE_SIZE>>>(positions, velocities, n, params.dt);
+                drift_kernel<<<blocks, TILE_SIZE>>>(positions, precise_positions, velocities, n, params.dt);
                 acceleration_kernel<<<blocks, TILE_SIZE>>>(positions, acceleration, n, params.G, params.softening * params.softening);
                 const float kick_dt = (step == params.steps) ? 0.5f * params.dt : params.dt;
                 kick_kernel<<<blocks, TILE_SIZE>>>(velocities, acceleration, n, kick_dt);
@@ -302,11 +318,11 @@ int main(int argc, char** argv) {
          float gpu_milliseconds = 0.0f;
          CUDA_CHECK(cudaEventElapsedTime(&gpu_milliseconds, gpu_start, gpu_stop));
         CUDA_CHECK(cudaMemcpy(host_positions.data(), positions, n * sizeof(float4), cudaMemcpyDeviceToHost));
-         CUDA_CHECK(cudaMemcpy(host_velocities.data(), velocities, n * sizeof(float4), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(host_velocities.data(), velocities, n * sizeof(double4), cudaMemcpyDeviceToHost));
          std::vector<Body> final_bodies(n);
          for (int i = 0; i < n; ++i) {
              final_bodies[i] = {host_positions[i].x, host_positions[i].y, host_positions[i].z,
-                       host_velocities[i].x, host_velocities[i].y, host_velocities[i].z,
+                       static_cast<float>(host_velocities[i].x), static_cast<float>(host_velocities[i].y), static_cast<float>(host_velocities[i].z),
                        host_positions[i].w};
          }
          const Diagnostics final_diagnostics = compute_diagnostics(final_bodies, params.G, params.softening);
@@ -348,7 +364,8 @@ int main(int argc, char** argv) {
              << "cpu_benchmark_particles=" << cpu_particles << "\ncpu_benchmark_steps=" << cpu_steps << "\n"
              << "cpu_interactions_per_sec=" << cpu_rate << "\n"
              << "estimated_gpu_vs_cpu_speedup=" << (cpu_rate > 0 ? gpu_rate / cpu_rate : 0) << "\n"
-             << "device_array_bytes=" << static_cast<std::uint64_t>(3) * n * sizeof(float4) << "\n"
+             << "integration_accumulator=float64\nforce_precision=float32\ntrajectory_precision=float32\n"
+             << "device_array_bytes=" << static_cast<std::uint64_t>(n) * (2 * sizeof(float4) + 2 * sizeof(double4)) << "\n"
              << "gpu_memory_used_bytes=" << (total_memory - free_memory) << "\n"
              << "initial_momentum_norm=" << initial_momentum << "\n"
              << "relative_momentum_error=" << momentum_error << "\n"
@@ -363,7 +380,7 @@ int main(int argc, char** argv) {
          std::cout << report.str() << "trajectory_file=" << output_path << "\nperformance_log=" << log_path << "\n";
          CUDA_CHECK(cudaEventDestroy(gpu_start));
          CUDA_CHECK(cudaEventDestroy(gpu_stop));
-        cudaFree(positions); cudaFree(velocities); cudaFree(acceleration);
+        cudaFree(positions); cudaFree(precise_positions); cudaFree(velocities); cudaFree(acceleration);
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n';
         return 1;
