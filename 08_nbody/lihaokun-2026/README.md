@@ -119,5 +119,8 @@ python3 visualize.py results/benchmark_65536.bin \
 
 ## 显卡适配
 
+由于本项目主要利用cuda并行编程对粒子进行模型，因此需要进行平台适配的是`nbody.cu`文件
+
+- 在`nbody.maca`文件中完成对沐曦平台的粒子模拟代码适配；
 
 
